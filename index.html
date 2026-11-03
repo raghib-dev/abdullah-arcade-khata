@@ -810,7 +810,7 @@
 (function(){
   const FLATS = ["1A","1B","2A","2B","3A","3B","4A","4B","5A","5B"];
   const UNITS = FLATS.concat(["Clinic"]);
-  const CATEGORIES = ["Bijli Ka Bill (Electricity)","Aam Maintenance (Other)"];
+  const CATEGORIES = ["Bijli Ka Bill (Electricity)","Aam Maintenance (Other)","Late Payment Surcharge"];
   const PAYMENT_METHODS = ["Cash","JazzCash","EasyPaisa","Bank Transfer"];
   const ACCOUNT_OPTIONS = [
     "Cash in Hand (Physical)","JazzCash","Raast Transfer","SadaPay",
@@ -880,6 +880,7 @@
     if (type === 'expense'){
       editModalTitle.textContent = 'Kharcha Edit Karein';
       const catOptions = CATEGORIES.map(c=>`<option value="${c}" ${entry.category===c?'selected':''}>${c}</option>`).join('');
+      const unitOptions = `<option value="">— Sab Flats Par Taqseem —</option>` + UNITS.map(u=>`<option value="${u}" ${entry.targetUnit===u?'selected':''}>Sirf ${u}</option>`).join('');
       editModalFields.innerHTML = `
         <label>Date</label>
         <input type="date" id="ed-date" value="${entry.date||''}">
@@ -887,6 +888,8 @@
         <input type="text" id="ed-desc" value="${(entry.description||'').replace(/"/g,'&quot;')}">
         <label>Category</label>
         <select id="ed-cat">${catOptions}</select>
+        <label>Target Flat (Late Surcharge ke liye zaroori)</label>
+        <select id="ed-target">${unitOptions}</select>
         <label>Amount (Rs)</label>
         <input type="number" id="ed-amt" value="${entry.amount||0}" min="0">
       `;
@@ -938,6 +941,7 @@
       updateData.date = document.getElementById('ed-date').value;
       updateData.description = document.getElementById('ed-desc').value.trim();
       updateData.category = document.getElementById('ed-cat').value;
+      updateData.targetUnit = document.getElementById('ed-target').value || null;
     } else if (type === 'payment'){
       updateData.date = document.getElementById('ed-date').value;
       updateData.unit = document.getElementById('ed-unit').value;
@@ -966,8 +970,13 @@
   }
   function isElectricity(cat){ return cat === CATEGORIES[0]; }
 
+  // REVISED SHARE CALCULATION:
+  // Agar targetUnit specified hai (Late Surcharge) to 100% usi flat par jayega, sab par divide nahi hoga!
   function shareFor(exp, unit){
     const amt = Number(exp.amount) || 0;
+    if (exp.targetUnit){
+      return exp.targetUnit === unit ? amt : 0;
+    }
     const baseline = amt / 10;
     if (isElectricity(exp.category)){
       const clinicShare = baseline / 2;
@@ -996,6 +1005,17 @@
     if (Math.abs(bal) < 1) return "Sab Ada — koi baqaya nahi";
     if (bal > 0) return "Baqaya (due)";
     return "Ziada Ada Kiya (credit)";
+  }
+
+  function currentMonthPrefix(){
+    return new Date().toISOString().slice(0,7); // e.g. "2026-11"
+  }
+
+  function paidThisMonthFor(unit){
+    const cur = currentMonthPrefix();
+    return payments
+      .filter(p => p.unit === unit && (p.date || '').startsWith(cur))
+      .reduce((sum,p)=> sum + (Number(p.amount)||0), 0);
   }
 
   function totalCollectedAmt(){
@@ -1096,10 +1116,21 @@
     const cash = cashInHand();
     const outstanding = totalExpense - totalCollected;
 
-    const dueUnits = UNITS.filter(u => balanceClass(balanceFor(u)) === 'owe');
+    // Strict Defaulters: Baqaya > 0 AND this month payment === 0
+    const strictDueUnits = UNITS.filter(u => {
+      const bal = balanceFor(u);
+      return bal > 0.5 && paidThisMonthFor(u) === 0;
+    });
+
+    // Partial Payers: Baqaya > 0 BUT this month payment > 0 (Requested commitments)
+    const partialUnits = UNITS.filter(u => {
+      const bal = balanceFor(u);
+      return bal > 0.5 && paidThisMonthFor(u) > 0;
+    });
+
     const creditUnits = UNITS.filter(u => balanceClass(balanceFor(u)) === 'credit');
 
-    let unitRows = dueUnits.length ? dueUnits.map(u=>{
+    let unitRows = strictDueUnits.length ? strictDueUnits.map(u=>{
       const bal = balanceFor(u);
       return `<div class="unit-row" data-unit="${u}">
         <span class="unit-name">${u}</span>
@@ -1108,7 +1139,31 @@
           <span class="badge owe">Baqaya</span>
         </span>
       </div>`;
-    }).join('') : `<div class="empty-state">Alhamdulillah, koi flat baqaya nahi rakhta!</div>`;
+    }).join('') : `<div class="empty-state">Alhamdulillah, zero-payment wala koi flat nahi hai!</div>`;
+
+    let partialHtml = '';
+    if (partialUnits.length){
+      partialHtml = `
+        <div class="card" style="border-left-color:var(--gold);">
+          <h2>🤝 Partial Ada-igi (Baqi Commit Shuda)</h2>
+          <div class="note-banner info" style="margin-bottom:8px;">In flats ne is month partial payment kar di hai aur request ke mutabiq baqi ada-igi kuch dino me karenge:</div>
+          ${partialUnits.map(u=>{
+            const bal = balanceFor(u);
+            const paidMonth = paidThisMonthFor(u);
+            return `<div class="unit-row" data-unit="${u}">
+              <div>
+                <span class="unit-name">${u}</span>
+                <div style="font-size:11px; color:var(--ink-soft); margin-top:2px;">Is mahine jama: <b>${fmt(paidMonth)}</b></div>
+              </div>
+              <span>
+                <span class="unit-balance" style="color:#8a6d1f">${fmt(Math.abs(bal))}</span>
+                <span class="badge partial">Partial Paid</span>
+              </span>
+            </div>`;
+          }).join('')}
+        </div>
+      `;
+    }
 
     let advanceHtml = '';
     if (creditUnits.length){
@@ -1130,6 +1185,14 @@
       ? `<div class="note-banner warn">⚠️ Cash in Hand negative hai (${fmt(Math.abs(cash))} kam). Iska matlab jitna bill vendors ko ada kiya gaya, utni wasooli abhi tak nahi hui — upar "Advance" flats ne yeh shortfall cover kiya hai.</div>`
       : '';
 
+    const lateSurchargeBtn = isAdmin ? `
+      <div style="margin-bottom:12px; display:flex; gap:8px;">
+        <button class="primary" id="apply-surcharge-btn" style="margin-top:0; padding:10px; font-size:13px; background:linear-gradient(135deg, var(--bad), var(--maroon-dark));">
+          ⚡ Apply Late Surcharge (Sirf Unpaid Flats)
+        </button>
+      </div>
+    ` : '';
+
     main.innerHTML = `
       <div class="summary-grid">
         <div class="summary-box cash wide">
@@ -1150,13 +1213,16 @@
           <div class="value">${fmt(outstanding)}</div>
         </div>
       </div>
+      ${lateSurchargeBtn}
       ${cashWarning}
       ${advanceHtml}
       <div class="card">
-        <h2>Baqaya Rakhne Walay Flats</h2>
+        <h2>Baqaya Rakhne Walay Flats (Zero Payment This Month)</h2>
         ${unitRows}
       </div>
+      ${partialHtml}
     `;
+
     main.querySelectorAll('.unit-row').forEach(el=>{
       el.addEventListener('click', ()=>{
         activeUnit = el.getAttribute('data-unit');
@@ -1164,18 +1230,70 @@
         setTab('units');
       });
     });
+
+    const surchargeBtn = document.getElementById('apply-surcharge-btn');
+    if (surchargeBtn){
+      surchargeBtn.addEventListener('click', async ()=>{
+        const curMonth = currentMonthPrefix();
+        const amtStr = prompt("Late payment surcharge kitna add karna hai per unpaid flat? (Rs):", "300");
+        if (!amtStr) return;
+        const surchargeAmt = parseFloat(amtStr);
+        if (!surchargeAmt || surchargeAmt <= 0){ alert("Sahi amount enter karein."); return; }
+
+        // Sirf wo flats jinka balance > 0 hai aur is month payment 0 hai
+        const targets = UNITS.filter(u => {
+          if (u === "Clinic") return false;
+          const bal = balanceFor(u);
+          const paidThisM = paidThisMonthFor(u);
+          const alreadyCharged = expenses.some(e => 
+            e.category === "Late Payment Surcharge" && 
+            e.targetUnit === u && 
+            (e.date||'').startsWith(curMonth)
+          );
+          return bal > 0.5 && paidThisM === 0 && !alreadyCharged;
+        });
+
+        if (targets.length === 0){
+          alert("Kisi bhi flat par surcharge nahi lag sakta (Sab ne is month full ya partial payment ki hui hai, ya un par is mahine ka surcharge already laga hua hai).");
+          return;
+        }
+
+        if (!confirm(`${targets.length} flats (${targets.join(', ')}) ne is month 0 payment ki hai.\nIn sab par Rs. ${surchargeAmt} surcharge add karein?`)){
+          return;
+        }
+
+        surchargeBtn.disabled = true;
+        try{
+          for (const flat of targets){
+            await addDoc(collection(db, 'expenses'), {
+              date: todayStr(),
+              description: `Late Payment Surcharge (${flat}) - ${curMonth}`,
+              category: "Late Payment Surcharge",
+              targetUnit: flat,
+              amount: surchargeAmt
+            });
+          }
+          alert(`Rs. ${surchargeAmt} Late Payment Surcharge sirf un ${targets.length} flats (${targets.join(', ')}) par kamyabi se add kar diya gaya hai.`);
+        } catch(e){
+          alert("Error: " + e.message);
+        } finally{
+          surchargeBtn.disabled = false;
+        }
+      });
+    }
   }
 
   function renderExpenseForm(){
     subtitle.textContent = "Kharcha ka record";
     const catOptions = CATEGORIES.map(c=>`<option value="${c}">${c}</option>`).join('');
+    const unitTargetOptions = `<option value="">— Sab Flats Par Taqseem —</option>` + UNITS.map(u=>`<option value="${u}">Sirf ${u}</option>`).join('');
     const sortedExpenses = [...expenses].sort((a,b)=> b.date.localeCompare(a.date));
     const list = sortedExpenses.length ? sortedExpenses.map(e=>{
       const vs = vendorStatus(e);
       return `
       <div class="entry">
         <div class="left">
-          <div class="desc">${e.description || '(no description)'}</div>
+          <div class="desc">${e.description || '(no description)'} ${e.targetUnit ? `<span class="badge owe" style="font-size:10px;">Sirf Flat ${e.targetUnit}</span>` : ''}</div>
           <div class="meta">${e.date} · ${e.category}</div>
           <span class="badge ${vs.cls}">${vs.label}</span>
           ${e.receiptData ? `<button class="receipt-link" data-receipt="${e.id}">🧾 Bill Dekhein</button>` : ''}
@@ -1195,6 +1313,8 @@
         <input type="text" id="exp-desc" placeholder="misal: K-Electric bill - January">
         <label>Category</label>
         <select id="exp-cat">${catOptions}</select>
+        <label>Target Flat (Sirf tab chunein agar late surcharge ya specific flat ka bill ho)</label>
+        <select id="exp-target">${unitTargetOptions}</select>
         <label>Amount (Rs)</label>
         <input type="number" id="exp-amt" placeholder="0" min="0">
         <label>Bill / Receipt (Optional)</label>
@@ -1216,13 +1336,14 @@
         const date = document.getElementById('exp-date').value || todayStr();
         const desc = document.getElementById('exp-desc').value.trim();
         const cat = document.getElementById('exp-cat').value;
+        const targetUnit = document.getElementById('exp-target').value || null;
         const amt = parseFloat(document.getElementById('exp-amt').value);
         const fileInput = document.getElementById('exp-receipt');
         if (!amt || amt <= 0){ alert('Sahi amount likhein.'); return; }
         btn.disabled = true;
         const originalLabel = btn.textContent;
         try{
-          const docData = { date, description: desc, category: cat, amount: amt };
+          const docData = { date, description: desc, category: cat, targetUnit, amount: amt };
           if (fileInput.files && fileInput.files[0]){
             btn.textContent = 'Bill process ho raha hai...';
             try{
@@ -1542,15 +1663,14 @@
     const cls = balanceClass(bal);
     const unitExpenses = expenses
       .map(e => ({...e, share: shareFor(e, activeUnit)}))
-      .filter(e => e.share > 0 || activeUnit !== "Clinic")
-      .filter(e => !(activeUnit === "Clinic" && !isElectricity(e.category)))
+      .filter(e => e.share > 0)
       .sort((a,b)=> b.date.localeCompare(a.date));
     const unitPayments = payments.filter(p=>p.unit===activeUnit).sort((a,b)=> b.date.localeCompare(a.date));
 
     const expList = unitExpenses.length ? unitExpenses.map(e=>`
       <div class="entry">
         <div class="left">
-          <div class="desc">${e.description || '(no description)'}</div>
+          <div class="desc">${e.description || '(no description)'} ${e.targetUnit ? `<span class="badge owe" style="font-size:10px;">Direct Charge</span>` : ''}</div>
           <div class="meta">${e.date} · ${e.category}</div>
         </div>
         <div class="amt">${fmt(e.share)}</div>
